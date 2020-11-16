@@ -116,7 +116,8 @@ class iosrtcPlugin : CDVPlugin {
 			eventListenerForAddStream: self.saveMediaStream,
 			eventListenerForRemoveStream: self.deleteMediaStream,
 			eventListenerForAddTrack: self.saveMediaStreamTrack,
-			eventListenerForRemoveTrack: self.deleteMediaStreamTrack
+			eventListenerForRemoveTrack: self.deleteMediaStreamTrack,
+            pcId: pcId
 		)
 
 		// Store the pluginRTCPeerConnection into the dictionary.
@@ -337,6 +338,91 @@ class iosrtcPlugin : CDVPlugin {
 		self.queue.async { [weak pluginRTCPeerConnection, weak pluginMediaStream] in
 			pluginRTCPeerConnection?.removeStream(pluginMediaStream!)
 		}
+	}
+
+	@objc(RTCPeerConnection_addTransceiver:) func RTCPeerConnection_addTransceiver(_ command: CDVInvokedUrlCommand) {
+		let pcId = command.argument(at: 0) as! Int
+        let source = command.argument(at: 1) as! String
+		let receiverTrackId = command.argument(at: 2) as! String
+		let transceiverInitInput = command.argument(at: 3) as! NSDictionary
+		let pluginRTCPeerConnection = self.pluginRTCPeerConnections[pcId]
+		var pluginMediaStreamTrack: PluginMediaStreamTrack?
+		var mediaType: RTCRtpMediaType?
+        
+        switch source {
+            case "audio":
+                mediaType = RTCRtpMediaType.audio
+            case "video":
+                mediaType = RTCRtpMediaType.video
+            default:
+                NSLog("TRACK ID: %@", String(source))
+                pluginMediaStreamTrack = self.pluginMediaStreamTracks[source]
+
+                if pluginMediaStreamTrack == nil {
+                    NSLog("iosrtcPlugin#RTCPeerConnection_addTransceiver() | ERROR: pluginMediaStreamTrack with id=%@ does not exist", String(source))
+                    return;
+                }
+        }
+
+		if pluginRTCPeerConnection == nil {
+			NSLog("iosrtcPlugin#RTCPeerConnection_addTransceiver() | ERROR: pluginRTCPeerConnection with pcId=%@ does not exist", String(pcId))
+			return;
+		}
+
+		if pluginMediaStreamTrack == nil && mediaType == nil {
+			NSLog("iosrtcPlugin#RTCPeerConnection_addTransceiver() | ERROR: kind or track must be supplied")
+			return;
+		}
+		
+        self.queue.async { [weak pluginRTCPeerConnection, weak pluginMediaStreamTrack] in
+            let transceiverInit = RTCRtpTransceiverInit.init()
+            
+            if transceiverInitInput.object(forKey: "direction") != nil {
+                let direction = transceiverInitInput.object(forKey: "direction") as! String
+                
+                switch direction {
+                    case "inactive":
+                        transceiverInit.direction = RTCRtpTransceiverDirection.inactive
+                    case "sendonly":
+                        transceiverInit.direction = RTCRtpTransceiverDirection.sendOnly
+                    case "recvonly":
+                        transceiverInit.direction = RTCRtpTransceiverDirection.recvOnly
+                    default:
+                        transceiverInit.direction = RTCRtpTransceiverDirection.sendRecv
+                }
+            }
+            
+            if transceiverInitInput.object(forKey: "streamIds") != nil {
+                let pluginStreamIds = transceiverInitInput.object(forKey: "streamIds") as! [String]
+                
+                for (i, streamId) in pluginStreamIds.enumerated() {
+                    let pluginMediaStream = self.pluginMediaStreams[streamId]
+
+                    if pluginMediaStream == nil {
+                        NSLog("iosrtcPlugin#RTCPeerConnection_addTransceiver() | ERROR: pluginMediaStream with id=%@ does not exist", String(streamId))
+                        return;
+                    }
+
+                    // switch to real stream id before passing into rtc peer connection
+                    transceiverInit.streamIds[i] = pluginMediaStream!.rtcMediaStream.streamId
+                }
+            }
+            
+            pluginRTCPeerConnection?.addTransceiver(
+                pluginMediaStreamTrack,
+                mediaType: mediaType,
+                transceiverInit: transceiverInit,
+                receiverTrackId: receiverTrackId,
+                callback: { (response: NSDictionary) -> Void in
+                    self.emit(command.callbackId,
+                        result: CDVPluginResult(
+                            status: CDVCommandStatus_OK,
+                            messageAs: response as? [AnyHashable: Any]
+                        )
+                    )
+                }
+             )
+        }
 	}
 
 	@objc(RTCPeerConnection_addTrack:) func RTCPeerConnection_addTrack(_ command: CDVInvokedUrlCommand) {
@@ -861,7 +947,7 @@ class iosrtcPlugin : CDVPlugin {
 		}
 	}
 
-	@objc(MediaStreamTrack_setEnabled:) func MediaStreamTrack_setEnabled(_ command: CDVInvokedUrlCommand) {
+    @objc(MediaStreamTrack_setEnabled:) func MediaStreamTrack_setEnabled(_ command: CDVInvokedUrlCommand) {
 		NSLog("iosrtcPlugin#MediaStreamTrack_setEnabled()")
 
 		let id = command.argument(at: 0) as! String

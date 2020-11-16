@@ -1,13 +1,24 @@
-import { MediaStreamTrackShim } from './MediaStreamTrack';
+import { MediaStreamTrackAsJSON, MediaStreamTrackShim } from './MediaStreamTrack';
 import { RTCPeerConnectionShim } from './RTCPeerConnection';
 
+export interface RTCRtpReceiverAsJSON {
+	track: MediaStreamTrackAsJSON;
+	//transport: TODO
+}
+
 export class RTCRtpReceiverShim implements RTCRtpReceiver {
-	private _pc: RTCPeerConnectionShim;
 	public track: MediaStreamTrackShim;
 
-	constructor(data: { pc: RTCPeerConnectionShim; track: MediaStreamTrackShim }) {
-		this._pc = data.pc;
-		this.track = data.track;
+	constructor(
+		private pc: RTCPeerConnectionShim,
+		data: RTCRtpReceiverAsJSON | { track: MediaStreamTrackShim }
+	) {
+		this.track = pc.getOrCreateTrack(data.track);
+	}
+
+	update(update: RTCRtpReceiverAsJSON) {
+		this.track = this.pc.getOrCreateTrack(update.track);
+		// TODO additional fields
 	}
 
 	/**

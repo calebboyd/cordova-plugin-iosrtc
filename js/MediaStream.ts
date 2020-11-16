@@ -125,7 +125,7 @@ export const MediaStreamNativeShim = (function (
 		);
 	}
 
-	const onResultOK = (data: MediaStreamEvent) => this.onEvent(data);
+	const onResultOK = (data: MediaStreamEvent) => stream.onEvent(data);
 	exec(onResultOK, null, 'iosrtcPlugin', 'MediaStream_setListener', [stream.id]);
 
 	return stream;

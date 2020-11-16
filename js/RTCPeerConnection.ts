@@ -1,5 +1,4 @@
 import debugBase from 'debug';
-import { RTCRtpReceiverShim } from './RTCRtpReceiver';
 import { RTCRtpSenderShim } from './RTCRtpSender';
 import { RTCRtpTransceiverShim } from './RTCRtpTransceiver';
 import { EventTargetShim } from './EventTarget';
@@ -15,32 +14,38 @@ import {
 	MediaStreamAsJSON,
 	originalMediaStream
 } from './MediaStream';
-import { MediaStreamTrackShim, MediaStreamTrackAsJSON } from './MediaStreamTrack';
+import {
+	MediaStreamTrackShim,
+	MediaStreamTrackAsJSON,
+	newMediaStreamTrackId
+} from './MediaStreamTrack';
 import { detectDeprecatedCallbaksUsage, Errors } from './Errors';
 import { randomNumber } from './randomNumber';
+import { RTCRtpReceiverShim } from './RTCRtpReceiver';
+import { addTransceiverToPeerConnection, TransceiversUpdateEvent } from './cordova-bridge';
 
 const exec = require('cordova/exec'),
 	debug = debugBase('iosrtc:RTCPeerConnection'),
 	debugerror = require('debug')('iosrtc:ERROR:RTCPeerConnection');
 debugerror.log = console.warn.bind(console);
 
-interface AddStreamEvent {
+interface AddStreamEvent extends TransceiversUpdateEvent {
 	type: 'addstream';
 	streamId: string;
 	stream: MediaStreamAsJSON;
 }
 
-interface RemoveStreamEvent {
+interface RemoveStreamEvent extends TransceiversUpdateEvent {
 	type: 'removestream';
 	streamId: string;
 }
 
-interface TrackEvent {
+interface TrackEvent extends TransceiversUpdateEvent {
 	type: 'track';
 	track: MediaStreamTrackAsJSON;
 }
 
-interface TrackWithStreamEvent {
+interface TrackWithStreamEvent extends TransceiversUpdateEvent {
 	type: 'track';
 	track: MediaStreamTrackAsJSON;
 	streamId: string;
@@ -129,8 +134,9 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 
 	private localStreams: { [id: string]: MediaStreamShim } = {};
 	private remoteStreams: { [id: string]: MediaStreamShim } = {};
-	private localTracks: { [id: string]: MediaStreamTrackShim } = {};
-	private remoteTracks: { [id: string]: MediaStreamTrackShim } = {};
+	private tracks: { [id: string]: MediaStreamTrackShim } = {};
+	private transceivers: RTCRtpTransceiverShim[] = [];
+	private pendingRtpSenders: RTCRtpSenderShim[] = [];
 
 	constructor(private pcConfig: RTCConfiguration, pcConstraints?: PeerConnectionConstraints) {
 		super();
@@ -212,10 +218,12 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		debug('createOffer() [options:%o]', options);
 
 		return new Promise((resolve, reject) => {
-			const onResultOK = (data: RTCSessionDescriptionAsJSON) => {
+			const onResultOK = (data: RTCSessionDescriptionAsJSON & TransceiversUpdateEvent) => {
 					if (this.isClosed()) {
 						return;
 					}
+
+					this.updateTransceivers(data);
 
 					const desc = new RTCSessionDescriptionShim(data);
 
@@ -251,10 +259,12 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		debug('createAnswer() [options:%o]', options);
 
 		return new Promise((resolve, reject) => {
-			const onResultOK = (data: RTCSessionDescriptionAsJSON) => {
+			const onResultOK = (data: RTCSessionDescriptionAsJSON & TransceiversUpdateEvent) => {
 					if (this.isClosed()) {
 						return;
 					}
+
+					this.updateTransceivers(data);
 
 					const desc = new RTCSessionDescriptionShim(data);
 
@@ -300,10 +310,12 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		}
 
 		return new Promise((resolve, reject) => {
-			const onResultOK = (data: RTCSessionDescriptionAsJSON) => {
+			const onResultOK = (data: RTCSessionDescriptionAsJSON & TransceiversUpdateEvent) => {
 					if (this.isClosed()) {
 						return;
 					}
+
+					this.updateTransceivers(data);
 
 					debug('setLocalDescription() | success');
 					// Update localDescription.
@@ -361,10 +373,12 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		}
 
 		return new Promise((resolve, reject) => {
-			const onResultOK = (data: RTCSessionDescriptionAsJSON) => {
+			const onResultOK = (data: RTCSessionDescriptionAsJSON & TransceiversUpdateEvent) => {
 					if (this.isClosed()) {
 						return;
 					}
+
+					this.updateTransceivers(data);
 
 					debug('setRemoteDescription() | success');
 					// Update remoteDescription.
@@ -467,33 +481,85 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 	}
 
 	getReceivers() {
-		return Object.values(this.remoteTracks).map((track) => {
-			return new RTCRtpReceiverShim({
-				pc: this,
-				track: track
-			});
-		});
+		return this.getTransceivers()
+			.filter((transceiver) => !transceiver.stopped)
+			.map((transceiver) => transceiver.receiver);
 	}
 
 	getSenders() {
-		return Object.values(this.localTracks).map((track) => {
-			return new RTCRtpSenderShim({
-				pc: this,
-				track: track,
-				params: {} as RTCRtpSendParameters
-			});
-		});
+		return this.getTransceivers()
+			.filter((transceiver) => !transceiver.stopped)
+			.map((transceiver) => transceiver.sender);
 	}
 
 	getTransceivers() {
-		return [
-			...this.getReceivers().map((receiver) => {
-				return new RTCRtpTransceiverShim({ receiver });
+		return this.transceivers;
+	}
+
+	addTransceiver(
+		trackOrKind: MediaStreamTrackShim | string,
+		init?: RTCRtpTransceiverInit & { streams?: MediaStreamShim[] }
+	): RTCRtpTransceiverShim {
+		if (this.isClosed()) {
+			throw new Errors.InvalidStateError('peerconnection is closed');
+		}
+
+		const receiverTrackId = newMediaStreamTrackId(),
+			kind = trackOrKind instanceof MediaStreamTrackShim ? trackOrKind.kind : trackOrKind,
+			receiver = new RTCRtpReceiverShim(this, {
+				track: new MediaStreamTrackShim({
+					id: receiverTrackId,
+					kind,
+					enabled: true,
+					readyState: 'live',
+					trackId: 'unknown'
+				})
 			}),
-			...this.getSenders().map((sender) => {
-				return new RTCRtpTransceiverShim({ sender });
+			sender = new RTCRtpSenderShim(this, {
+				track: trackOrKind instanceof MediaStreamTrackShim ? trackOrKind : null
+			}),
+			direction = init?.direction ?? 'sendrecv',
+			transceiver = new RTCRtpTransceiverShim(this, {
+				receiver,
+				sender,
+				currentDirection: direction,
+				direction,
+				mid: null,
+				stopped: false
+			}),
+			createFromSource =
+				trackOrKind instanceof MediaStreamTrackShim ? trackOrKind.id : trackOrKind;
+
+		this.transceivers.push(transceiver);
+
+		addTransceiverToPeerConnection(this.pcId, createFromSource, receiverTrackId, {
+			direction,
+			streamIds: (init?.streams ?? []).map((stream) => stream.id)
+		})
+			.then((response) => {
+				console.log('ADD TRANS RESPON', response);
+				this.updateTransceivers(response);
 			})
-		];
+			.catch((e) => debugerror('addTransceiver() | failure: %s', e));
+
+		return transceiver;
+	}
+
+	private updateTransceivers(event: TransceiversUpdateEvent) {
+		console.log('UPDATE TRANSCEIVERS', event.transceivers);
+		this.transceivers = event.transceivers.map((update) => {
+			const localTransceiver = this.transceivers.find(
+				(transceiver) => transceiver.receiverId === update.receiver.track.id
+			);
+
+			if (localTransceiver) {
+				// already have the transceiver.  make sure it is up to date
+				localTransceiver.update(update);
+				return localTransceiver;
+			}
+
+			return new RTCRtpTransceiverShim(this, update);
+		});
 	}
 
 	addTrack(track: MediaStreamTrackShim, ...streams: MediaStreamShim[]) {
@@ -512,16 +578,16 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 			this.addStream(stream);
 		}
 
-		for (const id in this.localStreams) {
-			if (this.localStreams.hasOwnProperty(id)) {
+		for (const streamId in this.localStreams) {
+			if (this.localStreams.hasOwnProperty(streamId)) {
 				// Target provided stream argument or first added stream to group track
-				if (!stream || (stream && stream.id === id)) {
-					stream = this.localStreams[id];
+				if (!stream || (stream && stream.id === streamId)) {
+					stream = this.localStreams[streamId];
 					stream.addTrack(track);
 					exec(null, null, 'iosrtcPlugin', 'RTCPeerConnection_addTrack', [
 						this.pcId,
 						track.id,
-						id
+						streamId
 					]);
 					break;
 				}
@@ -537,13 +603,10 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 			]);
 		}
 
-		this.localTracks[track.id] = track;
+		this.getOrCreateTrack(track);
 
-		return new RTCRtpSenderShim({
-			pc: this,
-			track: track,
-			params: {} as RTCRtpSendParameters
-		});
+		// NOTE: this Sender instance is detached from the
+		return new RTCRtpSenderShim(this, { track });
 	}
 
 	removeTrack(sender: RTCRtpSenderShim) {
@@ -570,7 +633,7 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 			stream?.id ?? null
 		]);
 
-		delete this.localTracks[track.id];
+		delete this.tracks[track.id];
 	}
 
 	getStreamById(id: string) {
@@ -600,10 +663,7 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		stream.addedToConnection = true;
 
 		stream.getTracks().forEach((track) => {
-			this.localTracks[track.id] = track;
-			track.addEventListener('ended', () => {
-				delete this.localTracks[track.id];
-			});
+			this.getOrCreateTrack(track);
 		});
 
 		exec(null, null, 'iosrtcPlugin', 'RTCPeerConnection_addStream', [this.pcId, stream.id]);
@@ -630,7 +690,7 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		delete this.localStreams[stream.id];
 
 		stream.getTracks().forEach((track) => {
-			delete this.localTracks[track.id];
+			delete this.tracks[track.id];
 		});
 
 		exec(null, null, 'iosrtcPlugin', 'RTCPeerConnection_removeStream', [this.pcId, stream.id]);
@@ -718,13 +778,18 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		return this.signalingState === 'closed';
 	}
 
-	onEvent(data: PeerConnectionEvent) {
+	private onEvent(data: PeerConnectionEvent) {
 		const type = data.type,
 			event = new Event(type);
 
 		Object.defineProperty(event, 'target', { value: this, enumerable: true });
 
 		debug('onEvent() | [type:%s, data:%o]', type, data);
+
+		if ('transceivers' in data) {
+			// Some events contain transceiver updates
+			this.updateTransceivers(data);
+		}
 
 		switch (data.type) {
 			case 'signalingstatechange':
@@ -764,11 +829,12 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 
 			case 'track':
 				const track = new MediaStreamTrackShim(data.track),
-					receiver = new RTCRtpReceiverShim({ pc: this, track }),
+					transceiver = this.transceivers.find((t) => t.receiver.track.id === track.id),
+					receiver = transceiver?.receiver,
 					streams: MediaStreamShim[] = [];
 				(event as any).track = track;
 				(event as any).receiver = receiver;
-				(event as any).transceiver = new RTCRtpTransceiverShim({ receiver });
+				(event as any).transceiver = transceiver;
 				(event as any).streams = streams;
 
 				// Add stream only if available in case of Unified-Plan of track event without stream
@@ -779,10 +845,7 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 				}
 
 				// Store remote track
-				this.remoteTracks[track.id] = track;
-				track.addEventListener('ended', () => {
-					delete this.remoteTracks[track.id];
-				});
+				this.getOrCreateTrack(track);
 
 				break;
 
@@ -818,6 +881,28 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 		this.dispatchEvent(event);
 	}
 
+	getOrCreateTrack(trackInput: MediaStreamTrackAsJSON | MediaStreamTrackShim) {
+		const { id } = trackInput,
+			existingTrack = this.tracks[id];
+
+		if (existingTrack) {
+			return existingTrack;
+		}
+
+		const track =
+			trackInput instanceof MediaStreamTrackShim
+				? trackInput
+				: new MediaStreamTrackShim(trackInput);
+
+		// ensure track gets removed up when ended
+		this.tracks[id] = track;
+		track.addEventListener('ended', () => {
+			delete this.tracks[id];
+		});
+
+		return track;
+	}
+
 	/**
 	 * Additional events listeners
 	 */
@@ -843,14 +928,6 @@ export class RTCPeerConnectionShim extends EventTargetShim implements RTCPeerCon
 	readonly pendingRemoteDescription = null;
 	readonly sctp = null;
 
-	addTransceiver(
-		trackOrKind: MediaStreamTrackShim | string,
-		init?: RTCRtpTransceiverInit
-	): RTCRtpTransceiverShim {
-		void trackOrKind;
-		void init;
-		throw new Error('RTCPeerConnection.addTransceiver not implemented');
-	}
 	getIdentityAssertion(): Promise<string> {
 		return Promise.resolve('');
 	}

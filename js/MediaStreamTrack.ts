@@ -15,7 +15,7 @@ const exec = require('cordova/exec'),
 export const originalMediaStreamTrack =
 	window.MediaStreamTrack || function dummyMediaStreamTrack() {};
 
-function newMediaStreamTrackId() {
+export function newMediaStreamTrackId() {
 	return window.crypto.getRandomValues(new Uint32Array(4)).join('-');
 }
 
@@ -25,23 +25,23 @@ export type MediaStreamTrackAsJSON = {
 type StateChangeEvent = { type: 'statechange' } & Pick<MediaStreamTrack, 'readyState' | 'enabled'>;
 
 export class MediaStreamTrackShim extends EventTargetShim implements MediaStreamTrack {
-	id = this.dataFromEvent.id; // NOTE: It's a string.
-	kind = this.dataFromEvent.kind;
+	id = this.dataAsJSON.id; // NOTE: It's a string.
+	kind = this.dataAsJSON.kind;
 	label = ''; // Not supplied by swift
 	muted = false; // TODO: No "muted" property in ObjC API.
-	readyState = this.dataFromEvent.readyState;
+	readyState = this.dataAsJSON.readyState;
 
-	private _enabled = this.dataFromEvent.enabled;
+	private _enabled = this.dataAsJSON.enabled;
 	private _ended = false;
 
-	constructor(private dataFromEvent: MediaStreamTrackAsJSON) {
+	constructor(private dataAsJSON: MediaStreamTrackAsJSON) {
 		super();
 
-		if (!dataFromEvent) {
+		if (!dataAsJSON) {
 			throw new Error('Illegal MediaStreamTrack constructor');
 		}
 
-		debug('new() | [dataFromEvent:%o]', dataFromEvent);
+		debug('new() | [dataFromEvent:%o]', dataAsJSON);
 
 		const onResultOK = (data: StateChangeEvent) => this.onEvent(data);
 		exec(onResultOK, null, 'iosrtcPlugin', 'MediaStreamTrack_setListener', [this.id]);
@@ -76,7 +76,7 @@ export class MediaStreamTrackShim extends EventTargetShim implements MediaStream
 			kind: this.kind,
 			readyState: this.readyState,
 			enabled: this.enabled,
-			trackId: this.dataFromEvent.trackId
+			trackId: this.dataAsJSON.trackId
 		});
 	}
 

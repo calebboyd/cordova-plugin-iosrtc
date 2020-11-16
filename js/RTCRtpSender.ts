@@ -1,19 +1,22 @@
-import { MediaStreamTrackShim } from './MediaStreamTrack';
+import { MediaStreamTrackAsJSON, MediaStreamTrackShim } from './MediaStreamTrack';
 import { RTCPeerConnectionShim } from './RTCPeerConnection';
 
+export interface RTCRtpSenderAsJSON {
+	track: MediaStreamTrackAsJSON | null;
+}
+
 export class RTCRtpSenderShim implements RTCRtpSender {
-	private _pc: RTCPeerConnectionShim;
+	private readonly _pc: RTCPeerConnectionShim;
 	public track: MediaStreamTrackShim | null;
 	public params: RTCRtpSendParameters;
 
-	constructor(data: {
-		pc: RTCPeerConnectionShim;
-		track: MediaStreamTrackShim;
-		params: RTCRtpSendParameters;
-	}) {
-		this._pc = data.pc;
-		this.track = data.track;
-		this.params = data.params;
+	constructor(
+		pc: RTCPeerConnectionShim,
+		data: RTCRtpSenderAsJSON | { track: MediaStreamTrackShim | null }
+	) {
+		this._pc = pc;
+		this.track = data.track ? pc.getOrCreateTrack(data.track) : null;
+		this.params = {} as RTCRtpSendParameters;
 	}
 
 	getParameters() {
@@ -29,7 +32,7 @@ export class RTCRtpSenderShim implements RTCRtpSender {
 		const pc = this._pc;
 
 		return new Promise((resolve, reject) => {
-			pc.removeTrack(this as any);
+			pc.removeTrack(this);
 			if (withTrack) {
 				pc.addTrack(withTrack);
 			}
@@ -48,6 +51,16 @@ export class RTCRtpSenderShim implements RTCRtpSender {
 				}
 			});
 		});
+	}
+
+	update({ track }: RTCRtpSenderAsJSON) {
+		if (track) {
+			this.track = this._pc.getOrCreateTrack(track);
+		} else {
+			this.track = null;
+		}
+
+		// TODO additional fields
 	}
 
 	/**
